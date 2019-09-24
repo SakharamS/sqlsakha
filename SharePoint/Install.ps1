@@ -45,9 +45,10 @@
 #-------------------------------------------
 
 Import-Module KSTools
+
 $requiredVersion = ((Get-KSToolsVersion) -ge [version]"1.45.2")
 
-if (!($requiredVersion)) { write-hoststatus "SharePoint Update Installer: installation error - KSTools version not met" "FAIL" ; exit 3 }
+if (!($requiredVersion)) { Write-HostStatus "SharePoint Update Installer: installation error - KSTools version not met" "FAIL" ; exit 3 }
 
 #-------------------------------------------
 #  Script Constants
@@ -69,14 +70,17 @@ if (Test-Path $WorkingDirPath)
 {
 	Write-HostStatus "E:\Share\Temp Exists" "INFO"
 }
-else{
+else
+{
 	New-Item -ItemType Directory -Force -Path $WorkingDirPath
 }
 $errStatus = Get-ReturnCode -Value 'NoChanges'
 $ConfigFile = "$ScriptRoot\files\Updates.ini"
 $SP2010 = Test-Path "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\14.0\WSS\InstalledProducts\9014*"
 $SP2013 = Test-Path "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\15.0\WSS\InstalledProducts\9015*"
-$SP2016 = Test-Path "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\16.0\WSS\InstalledProducts\9016*"
+$SP2016 = Test-Path "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\16.0\WSS\InstalledProducts\90160000-110D*"
+$SP2019 = Test-Path "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\16.0\WSS\InstalledProducts\90160000-1167*"
+
     if ($SP2010 -eq "True")
     {
         $SPVer = "2010"
@@ -90,6 +94,11 @@ $SP2016 = Test-Path "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions
     if ($SP2016 -eq "True")
     {
         $SPVer = "2016"
+        $CUList = Get-Ini "$ConfigFile" -Section "$SPVer" -Raw -Flatten
+    }
+    if ($SP2019 -eq "True")
+    {
+        $SPVer = "2019"
         $CUList = Get-Ini "$ConfigFile" -Section "$SPVer" -Raw -Flatten
     }
 
@@ -551,14 +560,38 @@ if (Get-PendingReboot)
     Restart-Computer -Force
 }
 
+If($SPVer)
+{
+    Write-HostStatus "Sharepoint Version Detected: $SPVer" "INFO"
+}
+else
+{
+    Write-HostStatus "SharePoint installation could not be detected on the server." "FAIL" ; exit 109
+}
+
 New-EventLog -LogName KSTools -Source KPatch_SP -ErrorAction SilentlyContinue
 Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : Starting SharePoint patching script:" -Source KPatch_SP
-$InstalledUpdates = Get-WmiObject -Query "Select HotfixID From Win32_QuickFixEngineering" | Select-Object -ExpandProperty HotfixID
+
+$installedSPUpdates = Get-ChildItem -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall" | Get-ItemProperty -Name DisplayName,HelpLink -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -like '*SharePoint*'}
+$installedSPUpdatesList = @()
+foreach($spUpdate in $installedSPUpdates)
+{
+    $updateDetails = [PSCustomObject] @{
+                                            DisplayName = $spUpdate.DisplayName
+                                            KBNumber = If($spUpdate.HelpLink) { "KB" + ($spUpdate.HelpLink.split('/',5)[4]) } else { $null}
+                                        }
+    $installedSPUpdatesList += $updateDetails
+}
+
+#Write-Host "Currently Installed Updates : $installedSPUpdatesList" "INFO"
+$InstalledUpdates = $installedSPUpdatesList.KBNumber
+#$InstalledUpdates = Get-WmiObject -Query "Select HotfixID From Win32_QuickFixEngineering" | Select-Object -ExpandProperty HotfixID
+
 Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : Found $($InstalledUpdates.Count) installed hotfixes" -Source KPatch_SP
 $ErrorActionPreference = "Continue"
 
 $stamp = (get-date -format "yyyy-MM-dd HH:mm")
-write-hoststatus "SharePoint Update Installer: starting installation at $($stamp)" "INFO"
+Write-HostStatus "SharePoint Update Installer: starting installation at $($stamp)" "INFO"
 
 # ----------------------------------------------------------------------------
 #  Subsystem Installations
@@ -572,6 +605,17 @@ if ($CurrentVersion -eq $null)
 }
 
 $CurrentVersion = $CurrentVersion.Substring(0,$CurrentVersion.IndexOf(","))
+
+If($CurrentVersion -ge $AppVer)
+{
+    Write-HostStatus "Current Version $CurrentVersion is same as the new version $AppVer." "FAIL" ; exit
+}
+else
+{
+    Write-HostStatus "Current Version : $CurrentVersion. Upgrading to version $AppVer" "INFO"
+}
+
+$Updates = @()
 
 if (Add-Subsystem $AppKey "Install" "SYSTEM" $AppVer) 
 {
@@ -600,9 +644,10 @@ if (Add-Subsystem $AppKey "Install" "SYSTEM" $AppVer)
         # Updates and HotFixes
         #----------------------------
 
+        Write-HostStatus "Updates to be installed : $UpdateList" "INFO"
+
         foreach ($Update in $UpdateList)
         {
-            $DiskFreeSpace = Get-WmiObject -Query "Select DeviceID, FreeSpace FROM Win32_LogicalDisk Where DeviceID='E:'" | Select-Object -ExpandProperty FreeSpace
             if ($Update)
             {
                 $TotalPatchCount += 1
@@ -613,10 +658,12 @@ if (Add-Subsystem $AppKey "Install" "SYSTEM" $AppVer)
                 if ($InstalledUpdates -contains $KB)
                 {
                     $SuccessfulPatchCount += 1
+                    Write-HostStatus "The patch $KB is already installed on the server." "INFO"
                     Add-Event -Type "INFORMATION" -EventID 1 -Message "OK : $KB is already installed (QFE Check)" -Source KPatch_SP
                 }
                 else
                 {
+                    $UpdateFile = @()
                     if (Test-Path "$ScriptRoot\files\$Update.msu")
                     {
                         $UpdateFile = "$Update.msu"
@@ -630,6 +677,7 @@ if (Add-Subsystem $AppKey "Install" "SYSTEM" $AppVer)
                     if ($UpdateFile)
                     {
                         $FileSize = ((Get-Item "$ScriptRoot\files\$UpdateFile").Length) * 2
+                        $DiskFreeSpace = Get-WmiObject -Query "Select DeviceID, FreeSpace FROM Win32_LogicalDisk Where DeviceID='E:'" | Select-Object -ExpandProperty FreeSpace
                         if ($FileSize -ge $DiskFreeSpace)
                         {
                             $LogMessage = "FAIL : $ScriptRoot\files\$UpdateFile is larger than the available disk space, skipping patch"
@@ -646,13 +694,15 @@ if (Add-Subsystem $AppKey "Install" "SYSTEM" $AppVer)
                                 $PatchCommand = "E:\Share\Temp\$UpdateFile /quiet /norestart /log:E:\Share\Temp\$LogFile"
                                 Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : Installing $UpdateFile" -Source KPatch_SP
                                 Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : Command: $PatchCommand" -Source KPatch_SP
+                                Write-HostStatus "Installing Patch $Update. Command: $PatchCommand" "INFO"
                                 $patchStatus = Run $PatchCommand True True
+                                $patchStatus = 0
                             
                                 Remove-File "E:\Share\Temp\$Update.*"
                                 $SuccessfulPatchCount += Write-ExitCodeToEventLog -ExitCode $patchStatus -Patch $Update
                                 If ((Get-ExitDesc -Value $patchStatus) -eq "ERROR_SUCCESS_REBOOT_REQUIRED")
                                 {
-                                $RebootRequired = $true
+                                    $RebootRequired = $true
                                 }
                             }
                             else
@@ -664,6 +714,7 @@ if (Add-Subsystem $AppKey "Install" "SYSTEM" $AppVer)
                     else
                     {
                         Add-Event -Type "ERROR" -EventID 999 -Message "FAIL : Unable to find file for $Update on $ScriptRoot\files" -Source KPatch_SP
+                        Write-HostStatus "Unable to find the update $Update on the path $ScriptRoot\files." "ERROR"
                     }
                 }
             }
@@ -689,102 +740,123 @@ else
 #----------------------------
 # Cumulative Updates
 #----------------------------
-
+$Updates = @()
 $AppFName = "Microsoft SharePoint Cumulative Updates"
 $CUAppKey = "Microsoft\SharePoint\CU"
 if (Add-Subsystem $CUAppKey "Install" "SYSTEM" $AppVer) 
 {
     $CUSect = Get-Ini "$ConfigFile" -Section "$SPVer" -Raw -Flatten
+    If($CUSect)
+    {
         foreach ($entry in $CUSect)
         {
             $Updates+= "$entry"
         }
-    $CUList = $entry.Split("[ | ]")
-    $TempDir = Test-Path "E:\Share\Temp"
-    if(!($TempDir))
-    {
-        New-Item E:\Share\Temp -ItemType Directory | Out-Null
-    }
+    
+        $CUList = $entry.Split("[ | ]")
 
-    Write-Host $CUSect
-    Write-Host $CUList
+        $TempDir = Test-Path "E:\Share\Temp"
+        if(!($TempDir))
+        {
+            New-Item E:\Share\Temp -ItemType Directory | Out-Null
+        }
 
-    foreach ($CU in $CUList)
-    {
-        $DiskFreeSpace = Get-WmiObject -Query "Select DeviceID, FreeSpace FROM Win32_LogicalDisk Where DeviceID='E:'" | Select-Object -ExpandProperty FreeSpace
-        
-        Write-Host $KB
-        Write-Host $SPVer
+        Write-HostStatus "Cumulative Updates to be installed: $CUList" "INFO"
+
+        foreach ($CU in $CUList)
+        {
+            $DiskFreeSpace = Get-WmiObject -Query "Select DeviceID, FreeSpace FROM Win32_LogicalDisk Where DeviceID='E:'" | Select-Object -ExpandProperty FreeSpace       
 
             if ($CU -match "KB\d*")
             {
                 $KB = $Matches[0]
             }
-            if ($InstalledUpdates -contains $KB)
+            
+            If ($InstalledUpdates -contains $KB)
             {
                 $SuccessfulPatchCount += 1
                 Add-Event -Type "INFORMATION" -EventID 1 -Message "OK : CU: $KB is already installed (QFE Check)" -Source KPatch_SP
-            }
-            else
-            {
-                Write-Host "Copying $CUList to E:\Share\Temp"
-                Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Copying $CUList to E:\Share\Temp" -Source KPatch_SP
-                Copy-File "*.*" "$ScriptRoot\files\CU\$SPVer" "E:\Share\Temp"
-            }
-            
-            if (Test-Path "$ScriptRoot\files\CU\$SPVer\$CU.msu")
-            {
-                $CUFile = "$CU.msu"
-                $CULog = "$CU.evt"
-            }
-            if (Test-Path "$ScriptRoot\files\CU\$SPVer\$CU.exe")
-            {
-                $CUFile = "$CU.exe"
-                $CULog = "$CU.log"
-            }
-
-        if (Test-Path "$ScriptRoot\files\CU\$SPVer\$CUFile")
-        {
-                if (Test-Path "E:\Share\Temp\$CUFile")
+             }
+             else
+             {
+                $CUFile = @()           
+                if (Test-Path "$ScriptRoot\files\CU\$SPVer\$CU.msu")
                 {
-                    Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Successfully copied $CUFile to E:\Share\Temp" -Source KPatch_SP
-                    $PatchCommand = "E:\Share\Temp\$CUFile /quiet /norestart /log:E:\Share\Temp\$CULog"
-                    Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Installing $CUFile" -Source KPatch_SP
-                    Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Command: $PatchCommand" -Source KPatch_SP
-                    If($CUFile)
+                    $CUFile = "$CU.msu"
+                    $CULog = "$CU.evt"
+                }
+                If (Test-Path "$ScriptRoot\files\CU\$SPVer\$CU.exe")
+                {
+                    $CUFile = "$CU.exe"
+                    $CULog = "$CU.log"
+                }
+            
+                If($CUFile)
+                {
+                    $FileSize = ((Get-Item "$ScriptRoot\files\CU\$SPVer\$CUFile").Length) * 2
+                    $DiskFreeSpace = Get-WmiObject -Query "Select DeviceID, FreeSpace FROM Win32_LogicalDisk Where DeviceID='E:'" | Select-Object -ExpandProperty FreeSpace
+                    If ($FileSize -ge $DiskFreeSpace)
                     {
-                        $TotalPatchCount += 1
-                        $patchStatus = Run $PatchCommand True True
-                        $SuccessfulPatchCount += Write-ExitCodeToEventLog -ExitCode $patchStatus -Patch $CUFile
-                        If ((Get-ExitDesc -Value $patchStatus) -eq "ERROR_SUCCESS_REBOOT_REQUIRED")
-                        {
-                            $RebootRequired = $true
-                        }
-                        Start-Sleep -Seconds 10
-                        Remove-Item "E:\Share\Temp\$CU.*"
+                        $LogMessage = "FAIL : $ScriptRoot\files\$CUFile is larger than the available disk space, skipping patch"
+                        Add-Event -Type "ERROR" -EventID 999 -Message $LogMessage -Source KPatch_SP
                     }
+                    else
+                    {
+                        Write-HostStatus "Copying $CUFile to E:\Share\Temp" "INFO"
+                        Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Copying $CUList to E:\Share\Temp" -Source KPatch_SP
+                        Copy-File "*.*" "$ScriptRoot\files\CU\$SPVer" "E:\Share\Temp"
+                    
+                        If (Test-Path "E:\Share\Temp\$CUFile")
+                        {
+                           Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Successfully copied $CUFile to E:\Share\Temp" -Source KPatch_SP
+                           $PatchCommand = "E:\Share\Temp\$CUFile /quiet /norestart /log:E:\Share\Temp\$CULog"
+                           Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Installing $CUFile" -Source KPatch_SP
+                           Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : CU: Command: $PatchCommand" -Source KPatch_SP
+                          
+                           $TotalPatchCount += 1
+                           Write-HostStatus "Installing Cumilative Update $CU. Command: $PatchCommand" "INFO"
+                           $patchStatus = Run $PatchCommand True True
+                       
+                           $patchStatus = 0
+                           $SuccessfulPatchCount += Write-ExitCodeToEventLog -ExitCode $patchStatus -Patch $CUFile
+                           If ((Get-ExitDesc -Value $patchStatus) -eq "ERROR_SUCCESS_REBOOT_REQUIRED")
+                           {
+                               $RebootRequired = $true
+                           }
+                           Start-Sleep -Seconds 10
+                           Remove-Item "E:\Share\Temp\$CU.*"
+                        }
+                        else
+                        {
+                            Add-Event -Type "ERROR" -EventID 10 -Message "FAIL : CU: Failed to copy $CUFile to E:\Share\Temp" -Source KPatch_SP
+                            Write-HostStatus "Unable to find the executable file for CU $CU on the path E:\Share\Temp\$CUFile ." "ERROR"
+                        }         
+                     }
                 }
                 else
                 {
-                    Add-Event -Type "ERROR" -EventID 10 -Message "FAIL : CU: Failed to copy $CUFile to E:\Share\Temp" -Source KPatch_SP
-                }         
-        }
-        else
-        {
-            Add-Event -Type "ERROR" -EventID 999 -Message "FAIL : CU: Unable to find file for $CUFile on $ScriptRoot\files\CU\$SPVer" -Source KPatch_SP
-        }
-    }
+                    Add-Event -Type "ERROR" -EventID 999 -Message "FAIL : CU: Unable to find file for $CUFile on $ScriptRoot\files\CU\$SPVer" -Source KPatch_SP
+                    Write-HostStatus "Unable to find the update file for the CU $CU on the path $ScriptRoot\files\CU\$SPVer." "ERROR"
+                }
+             }
 
-    If($SuccessfulPatchCount -eq $TotalPatchCount)
-    {
-        Remove-Item "E:\Share\Temp\*.cab"
-        Remove-Item "E:\Share\Temp\*_MSPLOG*.log"
-		Remove-Item "E:\Share\Temp\*.exe"
-        Close-Subsystem $CUAppKey "Install" SYSTEM $AppVer
+             If($SuccessfulPatchCount -eq $TotalPatchCount)
+             {
+                 Remove-Item "E:\Share\Temp\*.cab"
+                 Remove-Item "E:\Share\Temp\*_MSPLOG*.log"
+		         Remove-Item "E:\Share\Temp\*.exe"
+                 Close-Subsystem $CUAppKey "Install" SYSTEM $AppVer
+                 Write-HostStatus "The SharePoint has been upgraded successfully from the version $CurrentVersion to $AppVer." "INFO"
+             }
+             else
+             {
+                 Add-Event -Type "ERROR" -EventID 999 -Message "Not all updates were installed succssfully, please re-run." -Source KPatch_SP
+             }
+         }
     }
     else
     {
-        Add-Event -Type "ERROR" -EventID 999 -Message "Not all updates were installed succssfully, please re-run." -Source KPatch_SP
+        Write-HostStatus "There are no cumulitave updates to be installed." "INFO"
     }
 }
 else
@@ -794,6 +866,7 @@ Add-Event -Type "INFORMATION" -EventID 1 -Message "OK : CU Revision is greater o
 
 if($TotalPatchCount -gt 0)
     {
+        Write-HostStatus "$SuccessfulPatchCount of $TotalPatchCount patches didn't encounter an error (they were installed successfully, already installed, or not applicable)." "INFO"
         $LogMessage = "$SuccessfulPatchCount of $TotalPatchCount patches didn't encounter an error (they were installed successfully, already installed, or not applicable)."
         Add-Event -Type "INFORMATION" -EventID 1 -Message $LogMessage -Source KPatch_SP 
         $LogMessage = "INFO : {0:P2} successful" -f $($SuccessfulPatchCount/$TotalPatchCount)
@@ -802,7 +875,7 @@ if($TotalPatchCount -gt 0)
         Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : Patching completed." -Source KPatch_SP
 
         $stamp = (get-date -format "yyyy-MM-dd HH:mm")
-        write-hoststatus "SharePoint Update Installer: installation completed at $($stamp)" "INFO"
+        Write-HostStatus "SharePoint Update Installer: installation completed at $($stamp)" "INFO"
 
         $RebootRequired = Get-PendingReboot
 
@@ -810,7 +883,7 @@ if($TotalPatchCount -gt 0)
         {
             Add-Event -Type "INFORMATION" -EventID 1 -Message "INFO : One or more patches requires a reboot to complete." -Source KPatch_SP
             $errStatus = 3010
-            write-hoststatus "SharePoint Update Installer: Restarting Server" "INFO"
+            Write-HostStatus "SharePoint Update Installer: Restarting Server" "INFO"
             Restart-Computer -Force
         }
 
